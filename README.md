@@ -1,4 +1,4 @@
-# blender-elegoo-fast-slice
+# blender-cura-fast-slice
 This is an addon for blender to make quick slice of your model without starting the GUI of Cura Engine. 
 
 # usage
