@@ -1,14 +1,14 @@
 bl_info = {
-    "name": "ELEGOO Cura quick slice",
+    "name": "Cura quick slice",
     "author": "Vjattich",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (3, 0, 0),
     "location": "F6 / Shift+F6 / File > Export > Quick Slice",
     "description": "Slice the active collection with CuraEngine into the .blend folder",
     "category": "Import-Export",
 }
 
-import bpy, os, re, json, math, zlib, shutil, tempfile, subprocess, time, glob
+import bpy, os, re, sys, json, math, zlib, shutil, tempfile, subprocess, time, glob
 from bpy.props import (StringProperty, FloatProperty, BoolProperty, EnumProperty,
                        IntProperty, CollectionProperty)
 
@@ -17,14 +17,39 @@ from bpy.props import (StringProperty, FloatProperty, BoolProperty, EnumProperty
 # Preferences
 # ---------------------------------------------------------------------------
 
+# "profile", "profile 3", "" - anything the user has not typed themselves.
+PLACEHOLDER_NAME = re.compile(r"^\s*(profile\s*\d*)?\s*$", re.IGNORECASE)
+
+
+def profile_name_from_path(path):
+    """Turn a path like tpu.def.json into the name "tpu"."""
+    stem = os.path.basename((path or "").strip().replace("\\", "/").rstrip("/"))
+    for _ in range(2):
+        stem, extension = os.path.splitext(stem)
+        if extension.lower() not in (".json", ".def"):
+            stem += extension
+            break
+    return stem.strip()
+
+
+def on_profile_path_set(self, context):
+    """Name the profile after its file, unless the user already named it."""
+    if PLACEHOLDER_NAME.match(self.name or ""):
+        name = profile_name_from_path(self.path)
+        if name:
+            self.name = name
+
+
 class QuickSliceProfile(bpy.types.PropertyGroup):
     name: StringProperty(
         name="Name", default="profile",
-        description="Shown in the F6 menu")
+        description="Shown in the F6 menu. Filled in from the .json file name "
+                    "until you type your own")
 
     path: StringProperty(
         name="Profile .json", subtype="FILE_PATH",
-        description="Printer definition exported from Cura (inherits fdmprinter)")
+        description="Printer definition exported from Cura (inherits fdmprinter)",
+        update=on_profile_path_set)
 
     suffix: StringProperty(
         name="Suffix",
@@ -65,8 +90,10 @@ class QuickSlicePreferences(bpy.types.AddonPreferences):
                     "e.g. layer_height=0.3, infill_sparse_density=10")
 
     verbose: BoolProperty(name="Verbose engine log", default=False)
-    open_folder: BoolProperty(name="Open folder when done", default=False)
     keep_stl: BoolProperty(name="Keep exported STL", default=True)
+    popup: BoolProperty(
+        name="Popup when done", default=True,
+        description="Show the result with Open folder / Save to SD buttons")
 
     def draw(self, context):
         column = self.layout.column()
@@ -80,8 +107,8 @@ class QuickSlicePreferences(bpy.types.AddonPreferences):
 
         row = column.row(align=True)
         row.prop(self, "verbose")
-        row.prop(self, "open_folder")
         row.prop(self, "keep_stl")
+        row.prop(self, "popup")
 
         column.separator()
         header = column.row(align=True)
@@ -550,12 +577,13 @@ def print_report(gcode_path, slice_seconds):
     print("[slice] %s layers @ %s mm | print %dh %02dm | %s | sliced in %.1fs" % (
         summary.get("LAYER_COUNT", "?"), summary.get("Layer height", "?"),
         minutes // 60, minutes % 60, summary.get("Filament used", "?"), slice_seconds))
+    return summary
 
 
 def slice_active_collection(profile_index=-1):
     """Export the active collection and slice it next to the .blend file.
 
-    Returns (gcode_path, warning, profile_name).
+    Returns (gcode_path, warning, profile_name, gcode_summary).
     """
     preferences = get_preferences()
     if not bpy.data.filepath:
@@ -607,18 +635,154 @@ def slice_active_collection(profile_index=-1):
         except OSError:
             pass
 
-    print_report(gcode_path, slice_seconds)
-
-    if preferences.open_folder:
-        subprocess.Popen(["explorer", "/select,", os.path.normpath(gcode_path)])
+    summary = print_report(gcode_path, slice_seconds)
 
     preferences.last_used = index
-    return gcode_path, warning, profile.name
+    return gcode_path, warning, profile.name, summary
+
+
+# ---------------------------------------------------------------------------
+# Removable drives
+# ---------------------------------------------------------------------------
+
+def removable_drives():
+    """Mounted removable volumes, the ones Cura offers as "Save to Removable Drive"."""
+    if os.name != "nt":
+        mounted = []
+        for pattern in ("/media/*/*", "/run/media/*/*", "/Volumes/*"):
+            mounted += [path for path in glob.glob(pattern) if os.path.isdir(path)]
+        return sorted(mounted)
+
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    mask = kernel32.GetLogicalDrives()
+    drives = []
+    for bit in range(26):
+        if not (mask >> bit) & 1:
+            continue
+        root = "%s:\\" % chr(ord("A") + bit)
+        # 2 == DRIVE_REMOVABLE. Card readers and USB sticks both report it.
+        if kernel32.GetDriveTypeW(ctypes.c_wchar_p(root)) == 2 and os.path.isdir(root):
+            drives.append(root)
+    return drives
+
+
+def drive_label(root):
+    """Volume name plus letter when the card has one, plain letter when it does not."""
+    if os.name != "nt":
+        return os.path.basename(root.rstrip("/")) or root
+
+    import ctypes
+    name = ctypes.create_unicode_buffer(261)
+    try:
+        ctypes.windll.kernel32.GetVolumeInformationW(
+            ctypes.c_wchar_p(root), name, 261, None, None, None, None, 0)
+    except Exception:
+        pass
+
+    short = root.rstrip("\\")
+    return "%s (%s)" % (name.value.strip(), short) if name.value.strip() else short
+
+
+def reveal_in_file_manager(path):
+    """Open the containing folder with the file selected."""
+    path = os.path.normpath(path)
+    if os.name == "nt":
+        subprocess.Popen(["explorer", "/select,", path])
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", "-R", path])
+    else:
+        subprocess.Popen(["xdg-open", os.path.dirname(path)])
+
+
+# ---------------------------------------------------------------------------
+# Post-slice popup
+# ---------------------------------------------------------------------------
+
+def summary_line(summary):
+    """One line of "142 layers | 1h 12m | 3.20m" for the popup."""
+    try:
+        minutes = int(float(summary.get("TIME", 0))) // 60
+        duration = "%dh %02dm" % (minutes // 60, minutes % 60)
+    except (TypeError, ValueError):
+        duration = "?"
+    return "%s layers | %s | %s" % (summary.get("LAYER_COUNT", "?"), duration,
+                                    summary.get("Filament used", "?"))
+
+
+def show_result_popup(gcode_path, warning, summary):
+    """Cura-style "done" notification: open the folder, or copy to the card."""
+    def draw(self, _context):
+        layout = self.layout
+        layout.label(text=os.path.basename(gcode_path))
+        layout.label(text=summary_line(summary))
+        if warning:
+            layout.label(text=warning, icon="ERROR")
+
+        layout.separator()
+        opener = layout.operator(QUICKSLICE_OT_open_folder.bl_idname,
+                                 text="Open Folder", icon="FILE_FOLDER")
+        opener.path = gcode_path
+
+        drives = removable_drives()
+        if not drives:
+            layout.label(text="no removable drive", icon="DISK_DRIVE")
+            return
+        for drive in drives:
+            copier = layout.operator(QUICKSLICE_OT_save_to_drive.bl_idname,
+                                     text="Save to " + drive_label(drive),
+                                     icon="DISK_DRIVE")
+            copier.path, copier.drive = gcode_path, drive
+
+    bpy.context.window_manager.popup_menu(
+        draw, title="Quick Slice", icon="ERROR" if warning else "CHECKMARK")
 
 
 # ---------------------------------------------------------------------------
 # Operators and menus
 # ---------------------------------------------------------------------------
+
+class QUICKSLICE_OT_open_folder(bpy.types.Operator):
+    bl_idname = "quickslice.open_folder"
+    bl_label = "Open Folder"
+    bl_description = "Show the sliced .gcode in the file manager"
+
+    path: StringProperty(options={"SKIP_SAVE"})
+
+    def execute(self, context):
+        try:
+            reveal_in_file_manager(self.path)
+        except Exception as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class QUICKSLICE_OT_save_to_drive(bpy.types.Operator):
+    bl_idname = "quickslice.save_to_drive"
+    bl_label = "Save to Removable Drive"
+    bl_description = "Copy the sliced .gcode to the root of the card, ready to print"
+
+    path: StringProperty(options={"SKIP_SAVE"})
+    drive: StringProperty(options={"SKIP_SAVE"})
+
+    def execute(self, context):
+        target = os.path.join(self.drive, os.path.basename(self.path))
+        try:
+            if not os.path.isfile(self.path):
+                raise RuntimeError("gcode is gone: " + self.path)
+            shutil.copyfile(self.path, target)
+            # The card is usually yanked out right after, so push it to the disk.
+            with open(target, "rb+") as handle:
+                os.fsync(handle.fileno())
+        except Exception as error:
+            self.report({"ERROR"}, "copy failed: %s" % error)
+            return {"CANCELLED"}
+
+        print("[slice] copied -> %s" % target)
+        self.report({"INFO"}, "saved to " + target)
+        return {"FINISHED"}
+
 
 class WM_OT_quick_slice(bpy.types.Operator):
     bl_idname = "wm.quick_slice"
@@ -629,7 +793,8 @@ class WM_OT_quick_slice(bpy.types.Operator):
 
     def execute(self, context):
         try:
-            path, warning, profile_name = slice_active_collection(self.profile_index)
+            path, warning, profile_name, summary = slice_active_collection(
+                self.profile_index)
         except Exception as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
@@ -638,6 +803,9 @@ class WM_OT_quick_slice(bpy.types.Operator):
             self.report({"WARNING"}, warning)
         else:
             self.report({"INFO"}, "%s -> %s" % (profile_name, os.path.basename(path)))
+
+        if get_preferences().popup:
+            show_result_popup(path, warning, summary)
         return {"FINISHED"}
 
 
@@ -731,6 +899,8 @@ CLASSES = (
     QUICKSLICE_OT_profile_remove,
     QUICKSLICE_OT_profile_move,
     QuickSlicePreferences,
+    QUICKSLICE_OT_open_folder,
+    QUICKSLICE_OT_save_to_drive,
     WM_OT_quick_slice,
     QUICKSLICE_MT_profiles,
     WM_OT_quick_slice_menu,
